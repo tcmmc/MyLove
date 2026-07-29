@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#050505">
+<title>Quietly, Completely</title>
+<style>
+  :root{
+    --black:#050505;
+    --pink-deep:#ff4fa3;
+    --pink-light:#ffc4df;
+    --white:#ffffff;
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0;
+    padding:0;
+    width:100%;
+    height:100%;
+    background:var(--black);
+    overflow:hidden;
+    overscroll-behavior:none;
+    -webkit-user-select:none;
+    user-select:none;
+  }
+  #stage{
+    position:fixed;
+    inset:0;
+    width:100%;
+    height:100%;
+  }
+  canvas{
+    position:absolute;
+    inset:0;
+    display:block;
+    touch-action:none;
+  }
+  #rain{ z-index:0; }
+  #fx{ z-index:1; }
+
+  /* Cheap CSS vignette — cinematic edge falloff, no extra canvas cost */
+  #vignette{
+    position:fixed;
+    inset:0;
+    pointer-events:none;
+    background:radial-gradient(ellipse at 50% 48%, rgba(0,0,0,0) 38%, rgba(0,0,0,0.55) 100%);
+    z-index:2;
+  }
+
+  /* ---------------- Text layer (always crisp, always DOM) ---------------- */
+  #textLayer{
+    position:fixed;
+    inset:0;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:0 9%;
+    pointer-events:none;
+    z-index:3;
+  }
+  #sentence{
+    font-family:-apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+    font-weight:300;
+    color:var(--white);
+    text-align:center;
+    font-size:clamp(1.25rem, 4.4vw, 2.5rem);
+    line-height:1.55;
+    letter-spacing:0.01em;
+    text-shadow:0 0 18px rgba(255,79,163,0.45), 0 0 42px rgba(255,196,223,0.22);
+    opacity:1;
+    transition:opacity 900ms cubic-bezier(.4,0,.2,1);
+  }
+  #sentence.hidden{ opacity:0; }
+  #sentence .word{ display:inline-block; white-space:nowrap; }
+  #sentence .char{
+    display:inline-block;
+    opacity:0;
+    transform:translateY(8px);
+    transition:opacity 620ms cubic-bezier(.2,.8,.2,1), transform 620ms cubic-bezier(.2,.8,.2,1);
+  }
+  #sentence .char.visible{
+    opacity:1;
+    transform:translateY(0);
+  }
+  /* The "elegant glow" pulse is a separate overlay animating ONLY opacity — opacity/transform
+     are the two properties a browser can animate on the compositor (GPU) without repainting.
+     Animating text-shadow's blur radius directly (the old approach) forces a full repaint of
+     the glyph shadow on every single frame, which is what caused the periodic FPS drops. */
+  #sentenceGlow{
+    position:fixed;
+    inset:0;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:0 9%;
+    pointer-events:none;
+    z-index:3;
+    font-family:-apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+    font-weight:300;
+    color:var(--white);
+    text-align:center;
+    font-size:clamp(1.25rem, 4.4vw, 2.5rem);
+    line-height:1.55;
+    letter-spacing:0.01em;
+    text-shadow:0 0 34px rgba(255,79,163,0.9), 0 0 68px rgba(255,196,223,0.55);
+    opacity:0;
+  }
+  #sentenceGlow.pulse{
+    animation:glowOpacityPulse 1600ms ease-in-out 1;
+  }
+  @keyframes glowOpacityPulse{
+    0%   { opacity:0; }
+    45%  { opacity:0.85; }
+    100% { opacity:0; }
+  }
+
+  /* Final message inside the heart */
+  #finalMessage{
+    position:fixed;
+    left:0; top:0;
+    transform:translate(-50%,-50%) scale(0.92);
+    font-family:-apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+    font-weight:300;
+    color:var(--white);
+    text-align:center;
+    font-size:clamp(0.95rem, 3vw, 1.45rem);
+    letter-spacing:0.02em;
+    white-space:nowrap;
+    text-shadow:0 0 16px rgba(255,79,163,0.6), 0 0 34px rgba(255,196,223,0.35);
+    opacity:0;
+    pointer-events:none;
+    z-index:4;
+    transition:opacity 1400ms cubic-bezier(.4,0,.2,1), transform 1400ms cubic-bezier(.4,0,.2,1);
+  }
+  #finalMessage.visible{
+    opacity:1;
+    transform:translate(-50%,-50%) scale(1);
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="rain"></canvas>
+  <canvas id="fx"></canvas>
+</div>
+<div id="vignette"></div>
+<div id="textLayer">
+  <div id="sentence"></div>
+</div>
+<div id="sentenceGlow" aria-hidden="true"></div>
+<div id="finalMessage"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+     CONFIG — edit freely to customize the letter
+     ============================================================ */
+  const SENTENCES = [
+    "Every day feels a little brighter simply because you exist.",
+    "You never asked for my heart...\nyet somehow it learned your name before I did.",
+    "In a world full of millions of people,\nmy eyes still search for only one smile.",
+    "With you,\neven silence becomes the most beautiful conversation.",
+    "If love had a favorite place,\nit would be wherever you are.",
+    "No matter where life takes us,\nmy heart will always find its way back to you.",
+    "Thank you...\nfor turning ordinary days into my favorite memories.",
+    "You are the most beautiful part of every tomorrow I dream about."
+  ];
+  const FINAL_MESSAGE = "You Are My Love \u2764\uFE0F";
+
+  const TIMING = {
+    holdMs: 2400,        // how long a sentence sits fully visible + glowing
+    fadeMs: 900,         // matches the CSS transition on #sentence
+    betweenMs: 350,      // brief breath before the next sentence begins revealing
+    heartFormMs: 3200,
+    heartMessageDelayMs: 700,
+    heartHoldMs: 5200,
+    heartDissolveMs: 1700,
+    loopPauseMs: 1000
+  };
+
+  /* ============================================================
+     DEVICE / PERFORMANCE PROFILE
+     ============================================================ */
+  const isSmallScreen = Math.min(window.innerWidth, window.innerHeight) < 700;
+  const isCoarsePointer = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+  const LOW_POWER = isSmallScreen || isCoarsePointer;
+
+  const DPR = Math.min(window.devicePixelRatio || 1, LOW_POWER ? 1.5 : 2);
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+  let W = window.innerWidth, H = window.innerHeight;
+
+  /* ============================================================================================
+     PART 1 — MATRIX-STYLE "I LOVE YOU" WORD RAIN BACKGROUND
+     Each column drops the actual phrase "I LOVE YOU" (not scrambled letters) using the same
+     column-drop + translucent-fade trick: a handful of draw calls per frame, and the fading
+     overlay does the work of keeping many trailing copies visible at once. Every layer's word
+     is pre-rendered ONCE into a single reusable sprite — the per-frame cost is just drawImage.
+     ============================================================================================ */
+  const rainCanvas = document.getElementById('rain');
+  const rainCtx = rainCanvas.getContext('2d', { alpha: false });
+
+  const RAIN_WORD = 'I LOVE YOU';
+  const RAIN_FONT = '600 FONTSIZEpx "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif';
+
+  // Four depth layers: a faint dense far layer plus back/mid/front, each with its own size,
+  // speed, opacity and blur — this is what sells "multiple depth layers" and keeps the field
+  // feeling dense without ever drawing more than a few dozen sprites in a given frame.
+  const RAIN_LAYERS_CONFIG = LOW_POWER
+    ? [
+        { fontSize: 9,  lineGap: 1.55, speedMs: 340, alpha: 0.16, blurPx: 1.0, colGap: 20, glow: false },
+        { fontSize: 12, lineGap: 1.5,  speedMs: 250, alpha: 0.26, blurPx: 0.8, colGap: 26, glow: false },
+        { fontSize: 16, lineGap: 1.5,  speedMs: 175, alpha: 0.44, blurPx: 0,   colGap: 34, glow: false },
+        { fontSize: 21, lineGap: 1.6,  speedMs: 120, alpha: 0.80, blurPx: 0,   colGap: 44, glow: true  }
+      ]
+    : [
+        { fontSize: 10, lineGap: 1.55, speedMs: 300, alpha: 0.17, blurPx: 1.1, colGap: 18, glow: false },
+        { fontSize: 13, lineGap: 1.5,  speedMs: 225, alpha: 0.28, blurPx: 1.0, colGap: 24, glow: false },
+        { fontSize: 18, lineGap: 1.5,  speedMs: 160, alpha: 0.46, blurPx: 0,   colGap: 32, glow: false },
+        { fontSize: 24, lineGap: 1.6,  speedMs: 108, alpha: 0.82, blurPx: 0,   colGap: 42, glow: true  }
+      ];
+
+  let rainLayers = [];
+
+  // Pre-render "I LOVE YOU" once per layer, blur/glow already baked in. Per-frame drawing then
+  // costs a single drawImage — no live filter/shadowBlur, which is what actually keeps this
+  // stable at 60fps on real devices (live canvas filters are slow, especially without a GPU).
+  const rainMeasureCtx = document.createElement('canvas').getContext('2d');
+
+  function buildWordSprite(cfg) {
+    const font = RAIN_FONT.replace('FONTSIZE', cfg.fontSize);
+    rainMeasureCtx.font = font;
+    const textWidth = rainMeasureCtx.measureText(RAIN_WORD).width;
+    const padX = cfg.fontSize * 0.7, padY = cfg.fontSize * 0.9;
+    const w = Math.ceil(textWidth + padX * 2);
+    const h = Math.ceil(cfg.fontSize + padY * 2);
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const g = c.getContext('2d');
+    g.font = font;
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    if (cfg.glow) {
+      g.shadowColor = 'rgba(255,79,163,0.9)';
+      g.shadowBlur = cfg.fontSize * 0.75;
+      g.fillStyle = 'rgba(255,255,255,0.95)';
+    } else {
+      if (cfg.blurPx) g.filter = 'blur(' + cfg.blurPx + 'px)';
+      g.fillStyle = 'rgba(255,79,163,' + cfg.alpha + ')';
+    }
+    g.fillText(RAIN_WORD, w / 2, h / 2);
+    return { canvas: c, w: w, h: h };
+  }
+
+  function buildRainLayers() {
+    rainLayers = RAIN_LAYERS_CONFIG.map((cfg) => {
+      const sprite = buildWordSprite(cfg);
+      const colWidth = sprite.w + cfg.colGap;
+      const colCount = Math.ceil(W / colWidth) + 1;
+      const stepH = sprite.h * cfg.lineGap;
+      const originOffset = Math.random() * colWidth; // desyncs layers so words don't stack in a grid
+      const columns = [];
+      for (let i = 0; i < colCount; i++) {
+        columns.push({
+          x: originOffset + i * colWidth + colWidth / 2,
+          row: -Math.floor(Math.random() * 8),
+          lastAdvance: performance.now() - Math.random() * cfg.speedMs,
+          driftPhase: Math.random() * Math.PI * 2
+        });
+      }
+      return { cfg: cfg, columns: columns, sprite: sprite, stepH: stepH };
+    });
+  }
+
+  function resizeRainCanvas() {
+    rainCanvas.width = Math.floor(W * DPR);
+    rainCanvas.height = Math.floor(H * DPR);
+    rainCanvas.style.width = W + 'px';
+    rainCanvas.style.height = H + 'px';
+    rainCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    rainCtx.fillStyle = '#050505';
+    rainCtx.fillRect(0, 0, W, H);
+    buildRainLayers();
+  }
+
+  function drawRain(now) {
+    // Trailing fade — never a hard clear. This is what gives each column its glowing streak
+    // of repeated "I LOVE YOU" copies scrolling down together.
+    rainCtx.fillStyle = 'rgba(5,5,5,0.09)';
+    rainCtx.fillRect(0, 0, W, H);
+
+    for (const layer of rainLayers) {
+      const cfg = layer.cfg;
+      const sprite = layer.sprite;
+      const halfW = sprite.w / 2, halfH = sprite.h / 2;
+
+      for (const col of layer.columns) {
+        if (now - col.lastAdvance < cfg.speedMs) continue;
+        col.lastAdvance = now;
+        col.row++;
+
+        const y = col.row * layer.stepH;
+        if (y > H + layer.stepH) {
+          col.row = -((Math.random() * 6) | 0); // loop straight back to the top — endless motion
+          continue;
+        }
+        if (y < -layer.stepH) continue;
+
+        const drift = Math.sin(now * 0.0003 + col.driftPhase) * 4;
+        rainCtx.drawImage(sprite.canvas, col.x + drift - halfW, y - halfH);
+      }
+    }
+  }
+
+  /* ============================================================================================
+     PART 2 — DECORATIVE PARTICLES + HEART FINALE (canvas "fx" layer, transparent, sits above rain)
+     These particles are pure decoration around the text, and the same pool gathers into a heart
+     for the ending. They never form letters — the readable text lives entirely in the DOM layer.
+     ============================================================================================ */
+  const fxCanvas = document.getElementById('fx');
+  const fxCtx = fxCanvas.getContext('2d', { alpha: true });
+
+  const PARTICLE_COUNT = LOW_POWER ? 160 : 260;
+
+  function resizeFxCanvas() {
+    fxCanvas.width = Math.floor(W * DPR);
+    fxCanvas.height = Math.floor(H * DPR);
+    fxCanvas.style.width = W + 'px';
+    fxCanvas.style.height = H + 'px';
+    fxCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+
+  function makeGlowSprite(color) {
+    const size = 128;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    grad.addColorStop(0, color + 'FF');
+    grad.addColorStop(0.35, color + 'AA');
+    grad.addColorStop(1, color + '00');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, size, size);
+    return c;
+  }
+
+  // Small pre-rendered heart glyph (tiny floating hearts) — glow baked in once, not per frame.
+  function makeHeartSprite(color) {
+    const size = 40;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const g = c.getContext('2d');
+    g.translate(size / 2, size / 2);
+    g.beginPath();
+    const scale = size / 42;
+    for (let i = 0; i <= 48; i++) {
+      const t = (i / 48) * Math.PI * 2;
+      const hx = 16 * Math.pow(Math.sin(t), 3) * scale;
+      const hy = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) * scale;
+      if (i === 0) g.moveTo(hx, hy); else g.lineTo(hx, hy);
+    }
+    g.closePath();
+    g.shadowColor = color;
+    g.shadowBlur = size * 0.22;
+    g.fillStyle = color;
+    g.fill();
+    return c;
+  }
+
+  // Small pre-rendered 4-point sparkle (soft twinkle) — same one-time-render principle.
+  function makeSparkleSprite(color) {
+    const size = 40;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const g = c.getContext('2d');
+    g.translate(size / 2, size / 2);
+    g.shadowColor = color;
+    g.shadowBlur = size * 0.28;
+    g.fillStyle = color;
+    g.beginPath();
+    const outer = size * 0.44, inner = size * 0.09, spikes = 4;
+    for (let i = 0; i < spikes * 2; i++) {
+      const r = i % 2 === 0 ? outer : inner;
+      const a = (Math.PI / spikes) * i - Math.PI / 2;
+      const x = Math.cos(a) * r, y = Math.sin(a) * r;
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.closePath();
+    g.fill();
+    return c;
+  }
+
+  const COLOR_HEX = { pinkDeep: '#ff4fa3', pinkLight: '#ffc4df', white: '#ffffff' };
+  const shapeSprites = { dot: {}, heart: {}, sparkle: {} };
+  Object.keys(COLOR_HEX).forEach((key) => {
+    shapeSprites.dot[key] = makeGlowSprite(COLOR_HEX[key]);
+    shapeSprites.heart[key] = makeHeartSprite(COLOR_HEX[key]);
+    shapeSprites.sparkle[key] = makeSparkleSprite(COLOR_HEX[key]);
+  });
+  const spriteWeights = ['pinkDeep', 'pinkDeep', 'pinkDeep', 'pinkLight', 'pinkLight', 'white'];
+
+  // Mostly soft glow dots, with a light sprinkling of tiny hearts and sparkles for
+  // "elegant cinematic" variety — kept rare so the scene stays minimal, not busy.
+  function rollShape() {
+    const r = Math.random();
+    if (r < 0.86) return 'dot';
+    if (r < 0.95) return 'heart';
+    return 'sparkle';
+  }
+
+  function easeInOutCubic(t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+  function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function makeParticle() {
+    const shape = rollShape();
+    return {
+      x: Math.random() * W,
+      y: Math.random() * H,
+      driftPhase: Math.random() * Math.PI * 2,
+      driftSpeed: 0.15 + Math.random() * 0.25,
+      floatSpeed: 3 + Math.random() * 5,
+      size: LOW_POWER ? (0.8 + Math.random() * 1.4) : (0.8 + Math.random() * 1.8),
+      baseAlpha: 0.12 + Math.random() * 0.32,
+      sprite: spriteWeights[(Math.random() * spriteWeights.length) | 0],
+      shape: shape,
+      formStartX: 0, formStartY: 0,
+      targetX: 0, targetY: 0,
+      delay: Math.random() * 0.3,
+      holdPhase: Math.random() * Math.PI * 2,
+      spinPhase: Math.random() * Math.PI * 2
+    };
+  }
+
+  let particles = [];
+  function buildParticles() {
+    particles = [];
+    for (let i = 0; i < PARTICLE_COUNT; i++) particles.push(makeParticle());
+  }
+
+  // Extra particles summoned only for the finale, so the heart reads as far denser than the
+  // everyday ambient field without permanently inflating the background particle budget.
+  let heartExtras = [];
+  function buildHeartExtras() {
+    const n = LOW_POWER ? 380 : 650;
+    heartExtras = [];
+    for (let i = 0; i < n; i++) heartExtras.push(makeParticle());
+  }
+
+  function updateAmbient(p, now, dt) {
+    p.y -= p.floatSpeed * dt;
+    p.x += Math.sin(now * 0.00035 * p.driftSpeed + p.driftPhase) * 0.1;
+    if (p.y < -20) { p.y = H + 20; p.x = Math.random() * W; }
+    if (p.x < -20) p.x = W + 20;
+    if (p.x > W + 20) p.x = -20;
+  }
+
+  /* ---- heart geometry (hollow outline so the message reads clearly at its center) ----
+     This does a getImageData read, which is comparatively expensive. It depends only on
+     W/H (not on time or particle state), so it is computed ONCE per resize and cached —
+     never recomputed on every loop cycle. That one change is what removed the periodic
+     FPS hitch that used to occur every time the heart finale began. */
+  const sampleCanvas = document.createElement('canvas');
+  const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+
+  function computeHeartInfo() {
+    sampleCanvas.width = W;
+    sampleCanvas.height = H;
+    sampleCtx.setTransform(1, 0, 0, 1, 0, 0);
+    sampleCtx.clearRect(0, 0, W, H);
+
+    const scale = Math.min(W, H) * (LOW_POWER ? 0.024 : 0.026);
+    const cx = W / 2;
+    const cy = H * 0.46;
+
+    sampleCtx.beginPath();
+    const steps = 200;
+    for (let i = 0; i <= steps; i++) {
+      const t = (i / steps) * Math.PI * 2;
+      const hx = 16 * Math.pow(Math.sin(t), 3);
+      const hy = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+      const px = cx + hx * scale;
+      const py = cy + hy * scale;
+      if (i === 0) sampleCtx.moveTo(px, py); else sampleCtx.lineTo(px, py);
+    }
+    sampleCtx.closePath();
+    sampleCtx.strokeStyle = '#ffffff';
+    sampleCtx.lineWidth = Math.min(W, H) * 0.028;
+    sampleCtx.lineJoin = 'round';
+    sampleCtx.stroke();
+
+    const img = sampleCtx.getImageData(0, 0, W, H).data;
+    const stride = Math.max(1, Math.round(Math.min(W, H) / (LOW_POWER ? 220 : 300)));
+    const points = [];
+    for (let y = 0; y < H; y += stride) {
+      for (let x = 0; x < W; x += stride) {
+        const idx = (y * W + x) * 4;
+        if (img[idx + 3] > 100) points.push({ x: x, y: y });
+      }
+    }
+    return { points: points, cx: cx, cy: cy };
+  }
+
+  function assignTargets(pool, points) {
+    if (!points.length) return;
+    const shuffled = points.slice();
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      const tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
+    }
+    for (let i = 0; i < pool.length; i++) {
+      const p = pool[i];
+      const src = shuffled[i % shuffled.length];
+      const jitter = i < shuffled.length ? 0 : 2.5;
+      p.formStartX = p.x; p.formStartY = p.y;
+      p.targetX = src.x + (jitter ? (Math.random() - 0.5) * jitter : 0);
+      p.targetY = src.y + (jitter ? (Math.random() - 0.5) * jitter : 0);
+      p.delay = Math.random() * 0.3;
+    }
+  }
+
+  function scatterOutward(pool) {
+    const cx = W / 2, cy = H / 2;
+    for (let i = 0; i < pool.length; i++) {
+      const p = pool[i];
+      p.formStartX = p.x; p.formStartY = p.y;
+      const angle = Math.atan2(p.y - cy, p.x - cx) + (Math.random() - 0.5) * 1.2;
+      const dist = Math.max(W, H) * (0.5 + Math.random() * 0.5);
+      p.targetX = cx + Math.cos(angle) * dist;
+      p.targetY = cy + Math.sin(angle) * dist;
+      p.delay = Math.random() * 0.25;
+    }
+  }
+
+  function updateForming(p, t) {
+    const localT = clamp01((t - p.delay) / (1 - p.delay));
+    const eased = easeInOutCubic(localT);
+    p.x = lerp(p.formStartX, p.targetX, eased);
+    p.y = lerp(p.formStartY, p.targetY, eased);
+  }
+
+  // A real heartbeat has two beats per cycle (lub-dub) then a rest, not a smooth sine —
+  // this sum of two narrow Gaussian bumps gives that same felt rhythm, just gentle in amplitude.
+  function heartbeatPulse(tMs) {
+    const period = 1100; // ~55 BPM — slow, calm, romantic rather than urgent
+    const t = tMs % period;
+    const lub = Math.exp(-Math.pow((t - 90) / 55, 2));
+    const dub = 0.55 * Math.exp(-Math.pow((t - 300) / 70, 2));
+    return lub + dub; // roughly 0..1.5
+  }
+
+  // particleMode: 'ambient' | 'heart-form' | 'heart-hold' | 'heart-dissolve'
+  let particleMode = 'ambient';
+  let modeStart = performance.now();
+  let heartInfo = null;       // cached once per resize — see computeHeartInfo() above
+  let currentPool = [];       // 'particles' in ambient mode, 'particles+heartExtras' during the finale
+
+  function setParticleMode(mode) {
+    particleMode = mode;
+    modeStart = performance.now();
+    if (mode === 'heart-form') {
+      // Extras "arrive" from random points across the screen, as if drawn from the wider field.
+      for (const p of heartExtras) { p.x = Math.random() * W; p.y = Math.random() * H; }
+      currentPool = particles.concat(heartExtras);
+      assignTargets(currentPool, heartInfo.points);
+    } else if (mode === 'heart-dissolve') {
+      scatterOutward(currentPool);
+    } else if (mode === 'ambient') {
+      currentPool = particles;
+    }
+    // 'heart-hold' intentionally keeps whatever pool heart-form already assembled.
+  }
+
+  function updateParticles(now, dt) {
+    const elapsed = now - modeStart;
+    if (particleMode === 'ambient') {
+      for (const p of currentPool) updateAmbient(p, now, dt);
+    } else if (particleMode === 'heart-form') {
+      const t = clamp01(elapsed / TIMING.heartFormMs);
+      for (const p of currentPool) updateForming(p, t);
+    } else if (particleMode === 'heart-hold') {
+      const beat = heartbeatPulse(elapsed) * 0.028;
+      const cx = heartInfo.cx, cy = heartInfo.cy;
+      for (const p of currentPool) {
+        const dx = p.targetX - cx, dy = p.targetY - cy;
+        p.x = cx + dx * (1 + beat) + Math.sin(now * 0.0015 + p.holdPhase) * 0.6;
+        p.y = cy + dy * (1 + beat) + Math.cos(now * 0.0013 + p.holdPhase) * 0.6;
+      }
+    } else if (particleMode === 'heart-dissolve') {
+      const t = clamp01(elapsed / TIMING.heartDissolveMs);
+      for (const p of currentPool) updateForming(p, t);
+    }
+  }
+
+  function drawParticles(now) {
+    fxCtx.clearRect(0, 0, W, H);
+    fxCtx.globalCompositeOperation = 'lighter';
+    const isHeart = particleMode !== 'ambient';
+    for (const p of currentPool) {
+      const alpha = isHeart ? Math.min(1, p.baseAlpha + 0.55) : p.baseAlpha;
+      if (alpha <= 0.01) continue;
+      const sprite = shapeSprites[p.shape][p.sprite];
+      const sizeMul = p.shape === 'dot' ? (isHeart ? 5.0 : 3.6) : (isHeart ? 3.4 : 2.6);
+      const r = p.size * sizeMul;
+      fxCtx.globalAlpha = alpha;
+      fxCtx.drawImage(sprite, p.x - r, p.y - r, r * 2, r * 2);
+    }
+    fxCtx.globalAlpha = 1;
+    fxCtx.globalCompositeOperation = 'source-over';
+  }
+
+  /* ============================================================================================
+     PART 3 — CRISP DOM TEXT: fade in -> typewriter reveal -> glow -> hold -> fade out
+     ============================================================================================ */
+  const sentenceEl = document.getElementById('sentence');
+  const sentenceGlowEl = document.getElementById('sentenceGlow');
+  const finalMessageEl = document.getElementById('finalMessage');
+
+  function revealSentence(text) {
+    sentenceEl.innerHTML = '';
+    sentenceEl.classList.remove('hidden');
+
+    const lines = text.split('\n');
+    let charCount = 0;
+    const frag = document.createDocumentFragment();
+    lines.forEach((line, li) => {
+      const words = line.split(' ');
+      words.forEach((word, wi) => {
+        const wordSpan = document.createElement('span');
+        wordSpan.className = 'word';
+        for (const ch of word) {
+          const c = document.createElement('span');
+          c.className = 'char';
+          c.textContent = ch;
+          wordSpan.appendChild(c);
+          charCount++;
+        }
+        frag.appendChild(wordSpan);
+        if (wi < words.length - 1) frag.appendChild(document.createTextNode(' '));
+      });
+      if (li < lines.length - 1) frag.appendChild(document.createElement('br'));
+    });
+    sentenceEl.appendChild(frag);
+
+    const step = Math.max(16, Math.min(46, 1500 / Math.max(1, charCount)));
+    const chars = sentenceEl.querySelectorAll('.char');
+    chars.forEach((c, i) => { c.style.transitionDelay = (i * step) + 'ms'; });
+
+    // Double rAF ensures the browser paints the initial (invisible) state
+    // before we flip the class, so the transition actually plays.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      chars.forEach((c) => c.classList.add('visible'));
+    }));
+
+    return charCount * step + 650; // reveal duration incl. final char's own transition
+  }
+
+  async function showSentence(text) {
+    const revealTime = revealSentence(text);
+    sentenceGlowEl.innerHTML = text.split('\n').join('<br>');
+    await sleep(revealTime);
+    sentenceGlowEl.classList.remove('pulse');
+    void sentenceGlowEl.offsetWidth; // force reflow so the animation can restart cleanly
+    sentenceGlowEl.classList.add('pulse');
+    await sleep(TIMING.holdMs);
+    sentenceEl.classList.add('hidden');
+    sentenceGlowEl.classList.remove('pulse');
+    await sleep(TIMING.fadeMs);
+    await sleep(TIMING.betweenMs);
+  }
+
+  async function runHeartFinale() {
+    setParticleMode('heart-form');
+    await sleep(TIMING.heartFormMs);
+
+    setParticleMode('heart-hold');
+    if (heartInfo) {
+      finalMessageEl.textContent = FINAL_MESSAGE;
+      finalMessageEl.style.left = heartInfo.cx + 'px';
+      finalMessageEl.style.top = heartInfo.cy + 'px';
+    }
+    await sleep(TIMING.heartMessageDelayMs);
+    finalMessageEl.classList.add('visible');
+    await sleep(TIMING.heartHoldMs);
+
+    finalMessageEl.classList.remove('visible');
+    setParticleMode('heart-dissolve');
+    await sleep(TIMING.heartDissolveMs);
+
+    setParticleMode('ambient');
+    await sleep(TIMING.loopPauseMs);
+  }
+
+  async function orchestrate() {
+    // Let the rain/particles breathe on their own for a moment before the first line.
+    await sleep(1400);
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      for (const line of SENTENCES) {
+        await showSentence(line);
+      }
+      await runHeartFinale();
+    }
+  }
+
+  /* ============================================================================================
+     MAIN LOOP
+     ============================================================================================ */
+  function resizeAll() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    resizeRainCanvas();
+    resizeFxCanvas();
+    // Heart geometry depends only on W/H, so it's cached here — computed on resize,
+    // never recomputed every time the finale loops back around (that was the FPS hitch).
+    heartInfo = computeHeartInfo();
+  }
+  resizeAll();
+  buildParticles();
+  buildHeartExtras();
+  currentPool = particles;
+
+  let lastTime = performance.now();
+  let running = true;
+
+  function frame(now) {
+    if (!running) return;
+    const dt = Math.min(0.05, (now - lastTime) / 1000);
+    lastTime = now;
+
+    drawRain(now);
+    updateParticles(now, dt);
+    drawParticles(now);
+
+    requestAnimationFrame(frame);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    running = !document.hidden;
+    if (running) { lastTime = performance.now(); requestAnimationFrame(frame); }
+  });
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      resizeAll(); // recomputes heartInfo — resize is rare, so this cost is fine here
+      if (particleMode === 'heart-form' || particleMode === 'heart-hold') {
+        assignTargets(currentPool, heartInfo.points);
+      }
+    }, 200);
+  });
+
+  requestAnimationFrame(frame);
+  orchestrate();
+})();
+</script>
+</body>
+</html>
